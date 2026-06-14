@@ -7,6 +7,7 @@
 | [01-gpu-hisparse-architecture.md](01-gpu-hisparse-architecture.md) | GPU HiSparse 能力解读 + 架构分析（数据结构、生命周期、swap-in kernel、stream 模型、路径对比、配置） |
 | [02-npu-adaptation-plan.md](02-npu-adaptation-plan.md) | NPU HiSparse 适配方案（现状、主线方案、差异与对策、性能风险、分阶段落地） |
 | [03-nsa-vs-dsv4-differences.md](03-nsa-vs-dsv4-differences.md) | NSA（GLM-5/V3.2）与 DeepSeek-V4 的 HiSparse 路径差异（KV pool 契约、结构性差异、NPU 策略） |
+| [ASSIGNMENTS.md](ASSIGNMENTS.md) | 三人分工（A: residency kernel / B: SFA 寻址 / C: 内存池+生命周期+同步），含 P0–P5 阶段—负责人对照 |
 
 ---
 
