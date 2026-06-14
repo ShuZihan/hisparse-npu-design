@@ -117,7 +117,7 @@ attention_kv: 128K × 1152 bytes × 61 layers = 8.6 GB（需要 offload）
 
 ### 2.4 请求生命周期（NPU 完整流程）
 
-对标 GPU HiSparse 的 prefill → staging → decode → finish 四阶段，NPU 侧完整流程如下：
+对标 GPU HiSparse 的 prefill → staging → decode → finish 四阶段，NPU 侧完整流程如下。**本节描述 PD 混合（prefill 与 decode 在同一实例）场景**；PD 分离场景的差异见 §2.4.1。
 
 ```
 ┌─────────────┐     ┌──────────┐     ┌──────────────────────┐     ┌────────┐
@@ -191,6 +191,74 @@ forward_decode() (per layer):
 | Attention 输入 | 全量 kv_cache + sparse_indices + block_table | hot_buffer + top_k_device_locs |
 | 新增 | — | AscendC residency kernel + backup stream 同步 |
 
+#### 2.4.1 PD 混合 vs PD 分离的生命周期差异
+
+§2.4 描述的是 **PD 混合**场景。**PD 分离**（prefill 在 P 节点、decode 在 D 节点）下，D 节点的生命周期**没有 Staging 阶段**。
+
+根因：Staging 阶段的全部工作是"把 device 上的全量 KV 备份到 Host"（D2H copy）。PD 混合下 KV 是本地 prefill 算出来的、人在 device 上，必须自己搬；PD 分离下 KV 由 P 节点经 RDMA **直接写进 D 节点的 Host pool**，D 节点的 device 上从未出现过全量 KV，所以无备份可做、无 device 余量可释放。
+
+| 阶段 | PD 混合（同一实例） | PD 分离（D 节点） |
+|------|--------------------|-------------------|
+| KV 来源 | 本地 prefill，全量常驻 device | P 节点 RDMA 直接写 D 节点 Host pool |
+| device 是否有过全量 KV | 有 | **无**（只分配 logical 索引 + Host 目标） |
+| **Staging（D2H 备份）** | **有**——staging 的核心开销 | **跳过** |
+| 释放 device 余量槽位 | 有 | **无**（未占用过） |
+| hot buffer 初始状态 | prefill 已填满，标记为 resident | **空**——需修正 |
+| 准入触发点 | prefill 输出处理后 | D 节点 KV 传输完成后 |
+
+GPU 侧对应实现：PD 混合走 `admit_request_into_staging`（含 D2H 备份），PD 分离走 `admit_request_direct`（跳过备份）。
+
+**PD 分离的关键正确性修正**：`alloc_device_buffer` 默认把 hot buffer 标记为"已 resident"（`device_buffer_tokens = [0..buf_size-1]`），这在混合场景成立（prefill 真填满了），但 PD 分离下 buffer 是空的，必须修正：
+
+- 短序列（seq_len ≤ device_buffer_size）：从 Host pool 预加载填满 buffer（`_preload_to_device_buffer`）
+- 长序列：把 `device_buffer_tokens` 全置 -1，让 residency kernel 首步全 miss、从 Host 加载
+
+漏掉此修正，decode 首步会读到 hot buffer 中的垃圾数据。
+
+**NPU 适配影响**：
+
+1. PD 分离需 P 节点把 KV 写入 D 节点经 `aclrtHostRegister` 注册的 Host pool（RDMA / `aclrtMemcpy`），D 节点准入路径跳过 D2H 备份、只建 hot buffer + 修正 resident 标记。
+2. 优先做 PD 混合（§2.4），PD 分离作为后续场景（GPU 侧 dsv4 的 direct-to-host 路径目前仍是 `NotImplementedError`，仅 NSA 路径支持）。
+
+#### 2.4.2 prefill 长度 vs hot buffer 大小的两种场景
+
+设 `device_buffer_size = 4k`（hot buffer 容量）。staging 时 `alloc_device_buffer` 按 prefill 长度走两条分支（以下为 NSA 路径，`hisparse_coordinator.py:288-333` / `hisparse_memory_pool.py:240-276`）。
+
+**两个尺寸常量**：
+
+- `device_buffer_size`：hot buffer 标称容量（如 4k），decode 时 swap-in 的 LRU 缓存大小
+- `padded_buffer_size = device_buffer_size + page_size`：实际分配量，多出的一页是写**当前新生成 token** 的 reserved slot（长序列时新 token 写在这页，不占 LRU 缓存区）
+
+##### 场景 A：prefill ≤ 4k（短序列）
+
+整个序列装得进 hot buffer，**无需 swap-in**。
+
+| 步骤 | 行为 |
+|------|------|
+| staging 分配 | `alloc_size = 页对齐(prefill_len)`，**只分配实际需要的量**，不浪费到满 4k（`:297-300`） |
+| device 留存 | 全部 prefill token 都留在 device，全 resident |
+| decode | indexer 选 top-k → swap-in kernel 走 fast path 直接返回 device locs，**不读 Host**（全命中） |
+| 序列增长 | 每步 decode 若 `seq_len` 超过当前 buffer 容量，`_grow_device_buffers` 动态扩容（页对齐），直到触顶 `device_buffer_size`（`:335-406`，仅对 `seq_len ≤ device_buffer_size` 的 req 扩容） |
+| 触顶 | 当 `seq_len` 达到 `device_buffer_size`，分配量提升到 `padded_buffer_size`（加上 reserved page），此后转入场景 B 的行为 |
+
+PD 分离直连场景下短序列还需 `_preload_to_device_buffer` 从 Host 预热填满 buffer（见 §2.4.1）。
+
+##### 场景 B：prefill > 4k（长序列）
+
+序列装不下，**必须 swap-in**，hot buffer 当 LRU 缓存用。
+
+| 步骤 | 行为 |
+|------|------|
+| staging 分配 | `alloc_size = padded_buffer_size`（4k + reserved page，`:301-302`） |
+| device 留存 | 从 prefill 占用的全量槽位中**保留前 `device_buffer_size`（4k）个**作初始内容，其余 `free_hisparse_indices` 释放（`hisparse_memory_pool.py:250-251`） |
+| 初始标记 | `device_buffer_tokens = [0,1,...,4095]`（`:328-330`），告诉 swap-in kernel buffer 初始装的是 token 0~4095 |
+| decode | 每步 indexer 选 top-k → swap-in kernel 判定 hit/miss → miss 从 Host 搬入、按 LRU 踢出旧 token → 输出 `top_k_device_locs` |
+| 新 token | 每步生成的新 token 写入 reserved slot（`device_buffer_size` 位置，`map_last_loc_to_buffer:458-460`），并异步增量备份到 Host（§2.4 decode 流程） |
+
+**初始保留"前 4k"而非"最重要 4k"**：staging 时 decode 尚未开始、没有 query，无法判断 token 重要性，故按序列顺序取前 4k。这只是 LRU 缓存的初始值，decode 第一步 indexer 即按真实 query 选 top-k，miss 的从 Host 换入——一两步内 buffer 内容就被实际需要的 token 替换。
+
+**冷启动代价**：第一步 decode 的 top-k 与"前 4k"初始内容大概率不重合（尤其序列尾部 token，局部性最强却不在 buffer），首步 miss 较多、有一批 Host 搬运。因相邻 decode 步 top-k 高度重叠，一两步后命中率回升至稳态。NPU 上 Host 读延迟若偏大，此首步 penalty 被放大，可考虑 staging seeding 优化（保留尾部/sink 混合而非纯前 4k），见 §2.5。
+
 ### 2.5 性能风险
 
 | 风险 | 影响 | 缓解 |
@@ -198,6 +266,7 @@ forward_decode() (per layer):
 | Host 读延迟高 | miss penalty 大，hit rate 对性能影响被放大 | P0 探针实测；MTE 批量搬运掩盖延迟 |
 | SFA scatter read 慢 | 路线 C 按 2048 个散乱 slot 逐个读，比当前按 block 连续读慢 | 关注 MTE gather 模式；若不达标退回路线 B（compact gather） |
 | hit 判定并行度 | 纯 Scalar 线性扫描 4096 slots 串行慢（官方建议 minimize scalar work） | Vector 向量化批量比较，Scalar 仅做收集/派发（详见 §2.7.5） |
+| 长序列冷启动 | 首步 decode buffer 初始为"前 4k"，与真实 top-k 不重合，miss 多（§2.4.2）；NPU Host 读延迟大时首步 penalty 放大 | staging seeding 优化：保留尾部 recent + 头部 sink 混合而非纯前 4k；或 staging 末尾预热相关 token |
 
 ### 2.6 分阶段落地
 
@@ -338,7 +407,7 @@ API 名称与语义依据 AscendCL acl API (C) 官方文档核实（链接见 §
 
 HiSparse 用两条 stream：`main_stream`（forward decode）和 `backup_stream`（D2H 备份上一步 token）。
 
-#### 2.8.2 时序（对标 doc01 §2.5 GPU 时序）
+#### 2.8.2 时序（对标 doc01 §2.6 GPU 时序）
 
 ```
 main_stream    │ write KV ──┬─ indexer ─ residency kernel ─ SFA ─ ... (step N)
