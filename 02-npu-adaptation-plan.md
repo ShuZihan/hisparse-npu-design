@@ -28,7 +28,7 @@
 | HiSparse | 有（swap-in kernel） | **无** |
 | KV 常驻 | 启用 HiSparse 时不常驻 | 全量常驻 |
 
-**核心缺失**：没有 residency runtime（hit/miss/LRU/swap-in）。`aclrtHostRegister` 提供了 Device 访问 Host 内存的能力（Atlas A3/A2），但当前路径未使用。
+**核心缺失**：没有 residency runtime（hit/miss/LRU/swap-in）。`aclrtHostRegister` 在 Atlas A3/A2 上提供了 Device 访问 Host 内存的能力，但当前路径**完全未使用**——更进一步，本仓库代码是**主动绕开**它的（详见 §2.2.1 代码依据）：NPU 的 host pool 走普通 `pin_memory`、host↔device KV 搬运走显式 staged DMA（外部算子 `sgl_kernel_npu.kvcacheio.transfer_kv_dim_exchange`），全树没有任何"AI Core kernel 内直读 host 指针"的先例。这把 P0 探针的性质从"测个延迟"升级为"验证这个模式在昇腾上是否成立"（见 §2.2）。
 
 **目标**：KV cache 不全量常驻 NPU，只保留 hot buffer，全量 KV 放 host，按需 swap-in。
 
@@ -49,13 +49,59 @@
       addressing_mode=PHYSICAL_HOT_SLOT)
 ```
 
-**待验证前提**（P0 门控）：
+**待验证前提**（P0 门控 —— 这是一个**二元分叉**，不是单纯的性能调优）：
+
+P0 真正要回答的问题是：**昇腾 AI Core 能不能在 kernel 内直接解引用 `aclrtHostRegister` 注册的 host 指针。** 这个模式在本仓库的 NPU 路径中**没有任何先例**（§2.2.1），所以它的成败直接决定走哪条架构路径：
 
 1. `aclrtHostRegister` 返回的 `devPtr` 能否在 AscendC kernel 中做 DataCopy 读取
 2. 包含 Host memory read 的 AscendC kernel 能否被 CANN Graph capture/replay
 3. Host memory read 延迟是否可接受
 
-如果探针 1 不通过，退化为 Host 侧显式 H2D copy（stream + event），会打断 Graph 但仍可保证正确性。
+| 分叉 | 条件 | 架构后果 |
+|------|------|----------|
+| **路径 ①：零拷贝（1:1 对标 GPU）** | 探针 1 通过 | residency kernel 内"判定 + 搬运"一气呵成，对标 GPU HiSparse，上面的伪代码成立 |
+| **路径 ②：staged DMA（架构改造）** | 探针 1 不通过 | kernel 内**只能算出 miss list**，搬运必须退到 kernel 外，用既有的 `aclrtMemcpyAsync` / `transfer_kv_dim_exchange` 做显式 H2D（这正是当前 NPU 代码已有的范式），见下方"备选架构" |
+
+**备选架构（路径 ②，探针 1 失败时）**：
+
+```
+每步 decode (per layer):
+  npu_lightning_indexer → top_k_tokens [B, 2048]
+  → AscendC judge kernel（只判定，不搬运）:
+      输入: top_k_tokens, device_buffer_tokens, lru_state
+      输出: miss_list [B, M], evict_slots [B, M], top_k_device_locs [B, K]（hit 部分已填）
+  → host 侧发起 staged H2D（既有范式）:
+      aclrtMemcpyAsync(hot_buffer[evict_slots] ← host_pool[miss_list], H2D, copy_stream)
+      或 sgl_kernel_npu.kvcacheio.transfer_kv_dim_exchange(..., H2D)
+      回填 top_k_device_locs 的 miss 部分
+  → npu_sparse_flash_attention(..., sparse_indices=top_k_device_locs, ...)
+```
+
+路径 ② 的代价：**每步 decode 多一趟 device→host→device 往返**（kernel 出来拿 miss list、发 DMA、等完成、再进 SFA），打断 CANN Graph 的单图捕获，延迟特性与 GPU 完全不同。但正确性可保证，且复用了仓库已验证的 staged DMA 通路。**P0 必须先判明走①还是②**，因为两条路的 residency kernel 接口、生命周期、Graph 策略都不一样。
+
+#### 2.2.1 代码依据（本仓库现状）
+
+以下结论来自对本仓库 `sglang-v0.5.12` 既有 NPU 后端的审计，是上面"二元分叉"判断的硬证据。
+
+**(1) NPU 全程没有 host-register，且代码主动绕开它。** 分配器派发表把 NPU 显式路由到普通 pinned 内存，而非 CUDA 的 `cudaHostRegister`（[memory_pool_host.py:147](../sglang-v0.5.12/python/sglang/srt/mem_cache/memory_pool_host.py#L147)）：
+
+```python
+ALLOC_MEMORY_FUNCS = defaultdict(
+    lambda: alloc_with_host_register,   # CUDA 默认走 cudaHostRegister
+    {
+        "npu": alloc_with_pin_memory,    # NPU 走普通 pin_memory，不注册
+        "musa": alloc_with_pin_memory,
+    },
+)
+```
+
+且 `is_pin_memory_available()` 在没有 CUDA 时直接返回 `False`（`utils/common.py:656`）。全树 `grep aclrtHostRegister` 零功能性命中，唯一的 `aclrt` 字符串出现在一份 FAQ 报错日志示例里。**含义**：GPU HiSparse 赖以工作的"kernel 内 `ld.global.nc` 跨 PCIe 直读 host"模式，在 NPU 上从未被任何代码实践过——P0 是在验证一个未知模式，不是复用已知模式。
+
+**(2) 既有 NPU host↔device KV 搬运，走的是 staged DMA，不是零拷贝直读。** host 侧 KV 缓存的搬运委托给外部算子 `sgl_kernel_npu.kvcacheio.transfer_kv_dim_exchange`，带 `H2D` / `D2H` 方向参数（`memory_pool_host.py:499/507/606/614`）。这是显式分段拷贝语义，正是路径 ② 备选架构的现成通路。
+
+**(3) 本仓库没有任何可改的 AscendC 源码。** 全树 `grep DataCopy / GM2UB / SetFlag / __aicore__ / LocalTensor / TPipe` 零命中，无 `.cce` 文件，无 NPU 的 `.cpp`/pybind。所有 NPU 自定义算子来自**外部 pip 包 `sgl_kernel_npu`**（本仓库内不存在）。**含义**：写 residency kernel = 向外部 `sgl_kernel_npu` 包贡献新算子；改 SFA 寻址（路线 C）= 改 `torch_npu` / `sgl_kernel_npu` 里的算子——**两者的源码都不在本仓库手边**，需先打通外部包的本地构建/贡献链路（见 §2.6 P0 前置 与 ASSIGNMENTS.md 中 A 的工作量）。
+
+**(4) SFA 稀疏分页寻址是确证在用的（绿灯）。** `npu_sparse_flash_attention` 带 `layout_kv="PA_BSND"` + `block_table` + `sparse_block_size=1` + `sparse_mode=3` + `attention_mode=2` 真实在跑（[ascend_backend.py:949](../sglang-v0.5.12/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py#L949)），block_table 由 `req_to_token[...][:, ::page_size] // page_size` 构造（`:359`）。这给路线 C/B 一个确定的注入点，详见 §2.3.2。
 
 ### 2.3 差异与对策
 
@@ -65,10 +111,12 @@
 
 | | GPU | NPU |
 |--|--|--|
-| Host 内存注册 | `cudaHostRegister` + UVA | `aclrtHostRegister` (Atlas A3/A2) |
-| kernel 内读 Host | PTX `ld.global.nc`（texture cache streaming） | DataCopy via devPtr（待验证） |
+| Host 内存注册 | `cudaHostRegister` + UVA | `aclrtHostRegister`（Atlas A3/A2，**NPU 路径现无任何先例**，§2.2.1） |
+| kernel 内读 Host | PTX `ld.global.nc`（texture cache streaming） | DataCopy via devPtr（**P0b 门控**：通过→零拷贝；不通过→退 staged DMA，§2.2） |
+| 既有 host↔device 搬运范式 | kernel 内零拷贝直读 | 显式 staged DMA（`transfer_kv_dim_exchange` H2D/D2H，§2.2.1） |
+| kernel 源码位置 | 本仓库 `hisparse.cuh` 可读可改 | 外部包 `sgl_kernel_npu`，需先打通贡献链路（§2.2.1 / P0a） |
 | 并行模型 | SIMT：32 lanes 各读不同地址，隐式同步 | SIMD：MTE DMA 搬整块，Scalar core 做判定 |
-| Graph 兼容 | CUDA Graph 天然支持 | CANN Graph 待验证 |
+| Graph 兼容 | CUDA Graph 天然支持 | CANN Graph 待验证（路径②的 H2D 往返会打断单图捕获） |
 
 **SIMD vs SIMT 实现差异**：
 
@@ -300,18 +348,23 @@ PD 分离直连场景下短序列还需 `_preload_to_device_buffer` 从 Host 预
 
 | 阶段 | 目标 | 交付物 |
 |------|------|--------|
-| **P0: aclrtHostRegister 探针** | AscendC kernel 能否通过 devPtr 读 Host | 最小 kernel + 延迟数据 |
+| **P0a: `sgl_kernel_npu` 贡献链路** | 打通外部包的本地构建/编译/加载（本仓库无 AscendC 源码，§2.2.1） | 能编译并加载一个 hello-world AscendC 算子 |
+| **P0b: aclrtHostRegister 探针（门控分叉）** | AscendC kernel 能否通过 devPtr 读 Host —— **判明走路径①零拷贝还是②staged DMA** | 最小 kernel + 延迟数据 + 分叉结论 |
 | **P1: SFA 寻址探针** | 定位 DataCopyPA / GetKeyGmOffset 改动点 | 单层 golden test |
-| **P2: AscendC residency kernel** | hit/miss/LRU/copy 全流程 | 对齐 Python 参考实现 |
+| **P2: AscendC residency kernel** | hit/miss/LRU/copy 全流程（路径②则为 judge-only kernel + host 侧 staged DMA） | 对齐 Python 参考实现 |
 | **P3: SFA 路线 C 原型** | 扩展寻址 ABI | 多层 decode 对齐 full-resident |
-| **P4: CANN Graph 验证** | 端到端 Graph capture/replay | 性能 benchmark |
+| **P4: CANN Graph 验证** | 端到端 Graph capture/replay（路径② Graph 会被 H2D 往返打断，需评估） | 性能 benchmark |
 | **P5: 生产化** | 多请求、生命周期、异常回收、CP 路径（`do_cp_balance_attn`） | 压力测试 |
 
-P0 是门控节点。
+P0 是门控节点，且内含两个子任务：**P0a**（外部包贡献链路，是 P2/P3 写算子的前提）和 **P0b**（host-register 探针，决定 P2 的 kernel 形态——路径①一气呵成 vs 路径② judge-only + staged DMA）。两者不通过，后续阶段的接口设计都无法定稿。
 
 ### 2.7 AscendC Residency Kernel 算法设计
 
 §2.3.1 给出了 SIMD vs SIMT 的概念差异，本节展开到可据此编码的粒度。**调研依据**：以下设计基于 CANN 官方文档对 AI Core 硬件架构、指令队列、DataCopy 能力的描述（链接见 §2.7.6）。
+
+> **前置说明（源码不在本仓库）**：本仓库 `sglang-v0.5.12` 内**没有任何 AscendC 算子源码**——所有 NPU 自定义算子都来自外部包 `sgl_kernel_npu`（§2.2.1）。因此本节的 kernel 要落地为**向 `sgl_kernel_npu` 贡献的新算子**，前提是先完成 P0a（打通该外部包的本地构建/加载链路）。下面的伪代码是算子的目标逻辑，不是本仓库内可直接编辑的文件。
+>
+> **另注**：以下 Phase 1–3 描述的是 **P0b 通过（路径①零拷贝）** 的形态——judge、copy、输出都在一个 kernel 内。若 P0b 不通过（路径②），Phase 2 的 miss copy 从 kernel 内移出、改为 host 侧 staged DMA，kernel 退化为"judge-only"（只产 miss_list / evict_slots / hit 部分的 device_locs），见 §2.2 备选架构。
 
 > **导读：这节在解决难点①的工程落地。** GPU 那个一气呵成的 swap-in kernel，到 NPU 上要拆成"**先一批判断(Phase 1)，再流水线搬运(Phase 2)，最后输出格子号(Phase 3)**"。要看懂为什么这么拆，先记住两件 NPU 硬件的"脾气"：
 > 1. **Scalar 单元很弱**(官方叫它 "mini CPU")——所以判断"哪些页在桌上"这种批量比对，绝不能用它一个个比，必须交给 Vector 单元批量比。

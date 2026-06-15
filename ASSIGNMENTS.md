@@ -19,7 +19,7 @@
 
 ## A —— Residency Kernel（难点①：谁来搬页）
 
-**一句话职责**：写在 NPU 上"判断哪页在桌上、把缺的页从仓库搬上来、挤掉最久没看的页"的 AscendC kernel。**技术风险最高、最核心**——GPU 用一个 kernel 搞定的事，NPU 硬件不支持照抄。
+**一句话职责**：写在 NPU 上"判断哪页在桌上、把缺的页从仓库搬上来、挤掉最久没看的页"的 AscendC kernel。**技术风险最高、最核心**——GPU 用一个 kernel 搞定的事，NPU 硬件不支持照抄，而且**这个 kernel 的源码不在本仓库**：本仓库 `sglang-v0.5.12` 没有任何 AscendC 算子源码，所有 NPU 自定义算子都来自外部包 `sgl_kernel_npu`（[02 §2.2.1](02-npu-adaptation-plan.md)）。所以 A 的第一件事不是写 kernel，而是**打通 `sgl_kernel_npu` 的本地构建/贡献链路**（P0a）。
 
 **每步 decode 做什么**（对应 §2.7.3 三个 Phase）：
 
@@ -31,10 +31,16 @@
 
 | 阶段 | 干什么 |
 |------|--------|
-| **P0（门控，第一周冲刺）** | 最小探针 kernel，验证 §2.2 三个未知数：`aclrtHostRegister` 注册的 host 地址能否在 kernel 里 DataCopy 直读？延迟多大？能否被 Graph capture？ |
+| **P0a（前置，越早越好）** | 打通外部包 `sgl_kernel_npu` 的本地构建/编译/加载——本仓库无 AscendC 源码，不先搭好这条链路，P2 的 kernel 没处写、没法编译。先能跑通一个 hello-world AscendC 算子即可 |
+| **P0b（门控，第一周冲刺）** | 最小探针 kernel，验证 §2.2 三个未知数：`aclrtHostRegister` 注册的 host 地址能否在 kernel 里 DataCopy 直读？延迟多大？能否被 Graph capture？**这是二元分叉点**——见下方风险 |
 | **P2** | P0 通过后写完整 residency kernel（上面三个 Phase），对齐 C 的 Python 参考实现 |
 
-**最大风险**：P0 不通过（kernel 读不了 host）→ 架构退化为"Host 侧显式 H2D copy"，A 的 kernel 不再读 host、改由 C 在 stream 上发 copy。**A 第一周的 P0 结论直接决定 A 和 C 后面怎么写。**
+**最大风险（P0b 是二元分叉，不是单纯调优）**：P0b 的结论决定整个架构走哪条路，A 和 C 后面怎么写全看这一条——
+
+- **路径①（P0b 通过，kernel 能直读 host）**：1:1 对标 GPU，judge + copy + 输出在**一个 kernel 内**一气呵成，就是上面三个 Phase。
+- **路径②（P0b 不通过，kernel 读不了 host）**：搬运退出 kernel。A 的 kernel 退化为 **judge-only**（只判定、只产 miss_list / evict_slots / hit 部分的槽号），实际搬运改由 **C 在 stream 上发显式 H2D staged DMA**（复用仓库既有的 `transfer_kv_dim_exchange`，[02 §2.2 备选架构](02-npu-adaptation-plan.md)）。每步 decode 多一趟 device→host→device 往返，打断 Graph。
+
+**A 第一周的 P0b 结论直接决定 A 和 C 后面怎么写**，所以必须最先冲。
 
 ---
 
@@ -61,6 +67,8 @@
 | **P3** | 实现路线 C 原型，扩展寻址 ABI，多层 decode 对齐 full-resident；C 性能不行则切路线 B |
 
 **特点**：与 A、C 高度解耦——B 只关心"给我一张物理槽号清单，我让 SFA 正确读到对应 KV"。**B 可从第一天独立开干**，不必等 A 的 P0 结论。
+
+> 注意：`npu_sparse_flash_attention` 是 `torch_npu` / `sgl_kernel_npu` 的预编译算子，**源码不在本仓库**（[02 §2.2.1](02-npu-adaptation-plan.md)）。B 的 P1 第一步就是定位并拿到该算子源码、打通其构建链路（与 A 的 P0a 是同一条 `sgl_kernel_npu` 贡献通路，可共享成果）。
 
 ---
 
@@ -89,7 +97,7 @@
 | 同步（§2.8） | `main_stream` / `backup_stream` 双流 + event 红绿灯；守住"仓库没存好副本前别覆写书桌" |
 | **Python 参考实现** | 给 A 的 P2 做对齐 golden——**关键润滑剂**，让 A 写 kernel 时有对照物 |
 
-**P0 风险波及**：若 A 的 P0 不通过，C 要在 swap-in 路径加 stream 同步（Host 侧 H2D copy），会打断 Graph。留意 A 的 P0 结论。
+**P0 风险波及（C 要为两条路径都做准备）**：A 的 P0b 是二元分叉。**若走路径②**（kernel 读不了 host），swap-in 的实际搬运落到 C 头上——C 要在 swap-in 路径用既有的 `transfer_kv_dim_exchange` / `aclrtMemcpyAsync` 发显式 H2D staged DMA，并加 stream 同步，会打断 Graph。所以 C 的 staged DMA 通路（仓库已有范式，§2.2.1）无论哪条路径都值得早点摸熟——路径②它就是主力搬运手段。**密切留意 A 的 P0b 结论。**
 
 ---
 
@@ -97,8 +105,8 @@
 
 1. **交汇就一个数据结构**：A 的输出 = B 的输入 = `top_k_device_locs`（物理槽号清单）。**第一周三人先把它的 shape 和语义敲成契约**，之后各写各的，P3 自然能接上。
 2. **起跑姿势**（依赖关系决定）：
-   - **A 第一周全力冲 P0**（门控，结论影响全局）；
-   - **B、C 不必等 A，立刻并行开干**（B 探 SFA 寻址，C 搭 pool + 生命周期 + Python 参考实现）。
+   - **A 第一周全力冲 P0a + P0b**（P0a 打通 `sgl_kernel_npu` 构建链路是写任何 kernel 的前提，P0b 门控决定架构走①还是②，结论影响全局）；
+   - **B、C 不必等 A，立刻并行开干**（B 探 SFA 寻址、与 A 共享 `sgl_kernel_npu` 通路；C 搭 pool + 生命周期 + Python 参考实现 + 摸熟 staged DMA 通路）。
 3. **合体节点**：
    - **P4**：A 的 kernel + B 的 SFA + C 的同步端到端 CANN Graph capture/replay，三流第一次合体一起调；
    - **P5**：多请求、异常回收、CP 路径（§2.3.2 标注的未覆盖点）按子任务再分。
@@ -107,9 +115,10 @@
 
 | 阶段 | 主负责 | 协作 |
 |------|--------|------|
-| P0 aclrtHostRegister 探针（门控） | **A** | C 留意结论 |
+| P0a `sgl_kernel_npu` 构建链路 | **A** | B 共享通路 |
+| P0b aclrtHostRegister 探针（门控分叉） | **A** | C 留意结论（决定路径①/②） |
 | P1 SFA 寻址探针 | **B** | — |
-| P2 AscendC residency kernel | **A** | C 提供 Python 参考实现 |
+| P2 AscendC residency kernel（路径②为 judge-only + C 的 staged DMA） | **A** | C 提供 Python 参考实现；路径②下 C 接搬运 |
 | P3 SFA 路线 C 原型 | **B** | A 提供 `top_k_device_locs` |
 | P4 CANN Graph 验证 | **A + B + C** | 三流合体 |
 | P5 生产化（含 CP 路径） | **A + B + C** | 按子任务分 |
