@@ -17,8 +17,8 @@
 
 **GPU 实现**三步完成：indexer 选 top-k → swap-in kernel 原子完成 hit/miss/LRU/copy → FlashMLA 按 physical hot slot 读 KV。详见 [01-gpu-hisparse-architecture.md](01-gpu-hisparse-architecture.md)。
 
-**NPU 适配**的主线方案是 1:1 对标 GPU 架构：通过 `aclrtHostRegister` 让 AscendC kernel 直接读取 Host KV（对标 CUDA PTX `ld.global.nc`），在 kernel 内完成 hit/miss/LRU/copy。NPU 特有工作是 SFA 寻址扩展（支持 physical hot slot 直接寻址）和 AscendC kernel 重写。详见 [02-npu-adaptation-plan.md](02-npu-adaptation-plan.md)。
+**NPU 适配**的主线方案是 1:1 对标 GPU 架构：通过 `aclrtHostRegister` 让 AscendC kernel 直接读取 Host KV（对标 CUDA PTX `ld.global.nc`），在 kernel 内完成 hit/miss/LRU/copy。SFA 寻址走**路线 A（BSND，不改算子）**——hot buffer 当 `key/value` 以 BSND 布局传入、`block_table=None`、`sparse_indices` 填物理槽号；SFA 内核源码（`ops-transformer`）+ CI paramset 证实 BSND 一层寻址 + token 粒度是实测路径，无需改算子源码（注意 SFA 索引含 `s2StartIdx` 窗口基址、且 BSND 要求 query 同步切布局）。NPU 特有工作是 AscendC residency kernel 与 host swap-in 通路。详见 [02-npu-adaptation-plan.md](02-npu-adaptation-plan.md)。
 
 **GLM-5 和 DeepSeek-V4 必须分开做**——先做 GLM-5/NSA 通用路径。详见 [03-nsa-vs-dsv4-differences.md](03-nsa-vs-dsv4-differences.md)。
 
-**落地顺序**：P0-P5 六阶段（aclrtHostRegister 探针 → SFA 寻址探针 → AscendC residency kernel → SFA 路线 C 原型 → CANN Graph 验证 → 生产化），详见 [02 § 2.6](02-npu-adaptation-plan.md#26-分阶段落地)。
+**落地顺序**：P0-P5 六阶段（P0a 构建链 → P0b host 直读探针 → P1 SFA 寻址探针（验证不改算子的路线 A/A′）→ P2 AscendC residency kernel → P3 寻址路线定稿（A/A′ 优先，不通过才退路线 C 改算子）→ P4 CANN Graph 验证 → P5 生产化），详见 [02 § 2.6](02-npu-adaptation-plan.md#26-分阶段落地)。
