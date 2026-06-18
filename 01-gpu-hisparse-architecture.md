@@ -347,7 +347,7 @@ elif self.nsa_decode_impl == "tilelang":
 2. **HiSparse 做的就是"换生产者"**：它用 `swap_in_selected_pages`（一级，直接出 physical 行号）替换掉默认的 `transform_index_page_table_decode`（两级，logical → 查 block_table → physical），算子本身一行不改。
 3. **page_size 与寻址级数无关**：默认分支显式传 `page_size=1` 仍走两级翻译——印证了"一格放一个 token"和"要不要查表翻译"是两件独立的事。
 
-> **对 NPU 适配的提示**：这个"零修改"红利建立在 ① hot buffer 与 KV tensor 共用地址空间、② 算子接受 physical 行号清单 这两个前提上。NPU SFA 默认 PA_BSND 是 logical 索引 + block_table 两级寻址，不直接对位;但 SFA **内核源码**（`ops-transformer/attention/sparse_flash_attention`）+ CI paramset 证实它同样支持 **BSND 一层寻址**（`block_table=None`、`sparse_indices` 经 `+s2StartIdx` 后直接当 S 轴下标，`service_vector_mla.h:233`），与 GPU 的 physical 行号清单同构——**所以 NPU 同样能享受"零修改"红利，走 BSND 即可（02 文档路线 A）**。两点差异需注意：SFA 索引是**窗口相对**的（含 `s2StartIdx` 基址），不像 FlashMLA 是绝对行号;且 BSND 要求 query 也切到 BSND。改算子的路线 C 仅作 P1 验证失败时的兜底（SFA 源码可读但需自带构建分发，见 02 §2.3.2）。
+> **对 NPU 适配的提示**：这个"零修改"红利建立在 ① hot buffer 与 KV tensor 共用地址空间、② 算子接受 physical 行号清单 这两个前提上。NPU SFA 默认 PA_BSND 是 logical 索引 + block_table 两级寻址，不直接对位;但 SFA **内核源码**（`ops-transformer/attention/sparse_flash_attention`）确有 **BSND 一层寻址分支**（`isPa=false`：`block_table=None`、`sparse_indices` 经 `+s2StartIdx` 后当 S 轴下标，`service_vector_mla.h:233`），与 GPU 的 physical 行号清单同构——**所以 NPU 有望同样享受"零修改"红利，走 BSND（02 文档路线 A）**。但要注意证据边界：本地 CI 的 BSND 用例只覆盖 `K=16/32`（`K=2048` 走的是 PA_BSND），公开 `torch_npu` 文档虽有 BSND+2048+图模式示例，**生产形态 tuple 仍须 P1 golden 验证**，非"已实测"。另两点差异：SFA 索引是**窗口相对**的（含 `s2StartIdx` 基址），不像 FlashMLA 绝对行号;且 BSND 要求 query 同步切到 BSND。改算子的路线 C 仅作 P1 失败时兜底（SFA 源码可读但需自带构建分发，见 02 §2.3.2）。
 
 **DSv4 路径的 page_size 差异**
 

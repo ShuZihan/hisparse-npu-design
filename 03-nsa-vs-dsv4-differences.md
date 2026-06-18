@@ -132,11 +132,11 @@ SGLang NSA HiSparse (GPU 参考实现)
 **DeepSeek-V4 作为未来方向：**
 
 理由：
-- 需要在 NPU 上先完成 DSV4 模型的基础推理接入（C4/C128/SWA 多 pool 结构）
+- SGLang 已有 `DeepseekV4ForCausalLM` + `DeepseekV4AttnBackend`（`deepseek_v4.py:1021`、`deepseek_v4_backend.py:331`），但 **NPU 上 C4/C128/SWA 双路 attention 尚未接好**——这部分是独立的大工作量（不是"SGLang 完全没有 DSV4 路径"）
 - compress_ratio=4 引入压缩算术（`(last_locs - 3) // 4`）
 - swap-in 需要 page-padded layout 支持
 - FlashMLA 的 `extra_indices_in_kvcache` 接口在 NPU SFA 中没有等价物
-- SWA + C4 sparse 双路 attention 的 NPU 实现是独立的大工作量
+- C4/C128/SWA 多 pool 结构 + 双路 attention 的 NPU 适配是独立的大工作量
 
 适配路径：
 ```

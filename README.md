@@ -17,7 +17,7 @@
 
 **GPU 实现**三步完成：indexer 选 top-k → swap-in kernel 原子完成 hit/miss/LRU/copy → FlashMLA 按 physical hot slot 读 KV。详见 [01-gpu-hisparse-architecture.md](01-gpu-hisparse-architecture.md)。
 
-**NPU 适配**的主线方案是 1:1 对标 GPU 架构：通过 `aclrtHostRegister` 让 AscendC kernel 直接读取 Host KV（对标 CUDA PTX `ld.global.nc`），在 kernel 内完成 hit/miss/LRU/copy。SFA 寻址走**路线 A（BSND，不改算子）**——hot buffer 当 `key/value` 以 BSND 布局传入、`block_table=None`、`sparse_indices` 填物理槽号；SFA 内核源码（`ops-transformer`）+ CI paramset 证实 BSND 一层寻址 + token 粒度是实测路径，无需改算子源码（注意 SFA 索引含 `s2StartIdx` 窗口基址、且 BSND 要求 query 同步切布局）。NPU 特有工作是 AscendC residency kernel 与 host swap-in 通路。详见 [02-npu-adaptation-plan.md](02-npu-adaptation-plan.md)。
+**NPU 适配**的目标架构对标 GPU HiSparse：让 AscendC kernel 在 kernel 内完成 hit/miss/LRU/copy。但 GPU 那条"kernel 内跨总线直读 host"在 NPU 上是**高风险实验路线（路径①）**——CANN `aclrtHostRegister` 映射地址官方注明"不能用于 memory copy"，统一地址路（`MallocHostWithCfg`+VA_FLAG）措辞相反但需上机验证 kernel 内 `DataCopy` 可用性（P0b 门控，§2.2.2）。**基准退路是路径②（staged DMA）**：kernel 只判定、搬运用既有 host 侧 DMA，必须先跑通。SFA 寻址首选**路线 A（BSND，不改算子）**——`sparse_indices` 填物理槽号；SFA 内核确有 BSND 一层寻址分支、公开 `torch_npu` 文档有 BSND+2048+图模式示例，但本地 CI 的 BSND 用例仅 `K=16/32`（`K=2048` 走 PA_BSND），故**生产形态 tuple 须经 P1 golden 验证**，非"CI 已实测"。详见 [02-npu-adaptation-plan.md](02-npu-adaptation-plan.md)。
 
 **GLM-5 和 DeepSeek-V4 必须分开做**——先做 GLM-5/NSA 通用路径。详见 [03-nsa-vs-dsv4-differences.md](03-nsa-vs-dsv4-differences.md)。
 
