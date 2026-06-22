@@ -38,7 +38,7 @@
 **最大风险（P0b 决定走哪条路）**：P0b 的结论决定架构形态。**判定平面**(排序求交 hit 判定 + GatherMask 收集 + 归约 LRU)全部走 device 上已验证的 SIMD API、不依赖 host 直读([02 §2.7.3.1](02-npu-adaptation-plan.md)),所以 **A 不必等 P0b 结论才能动手写判定 kernel**——这部分风险低。注意:"device 读写 registered host"作为**能力**是昇腾官方支持的(A3/A2 √),但 HiSparse 要的具体用法——**kernel 内 `DataCopy` 直读 registered host**——官方未明说能否成立:`HostGetDevicePointer` 路的映射地址明注"不能用于 memory copy",仅统一地址路(`MallocHostWithCfg`+VA_FLAG)措辞相反([02 §2.2.2](02-npu-adaptation-plan.md))。故**路径①(kernel 内直读)是高风险实验路线,路径②(staged DMA)是必须先跑通的基准**——但路径②的 BSND 搬运 API 也需新建(见下文 #路径②)，并非现成。
 
 - **路径①（P0b 通过、带宽够）**：1:1 对标 GPU，judge + copy + 输出在**一个 kernel 内**一气呵成，就是上面三个 Phase。
-- **路径②（P0b 不通过 / 带宽不够）**：搬运退出 kernel。A 的 kernel 退化为 **judge-only**（只判定、只产 miss_list / evict_slots / hit 部分的槽号），实际搬运改由 **C 在 stream 上发显式 H2D staged DMA**。注意搬运 API 要按 hot buffer layout 选：仓库既有的 `transfer_kv_dim_exchange` 只适配 PA/page 布局（路线 A′），**BSND/token 布局（路线 A）需新写 staged copy**（[02 §2.2 备选架构](02-npu-adaptation-plan.md)）。每步 decode 多一趟 device→host→device 往返，Graph 需分段。
+- **路径②（P0b 不通过 / 带宽不够）**：搬运退出 kernel。A 的 kernel 退化为 **judge-only**（只判定、只产 miss_list / evict_slots / hit 部分的槽号），实际搬运改由 **C 在 stream 上发显式 H2D staged DMA**。注意搬运 API 要按 hot buffer layout 选：仓库既有的 `transfer_kv_dim_exchange` 更适合 PA/page 布局（路线 A），**BSND/token 布局（路线 B）需新写 staged copy**（[02 §2.2 备选架构](02-npu-adaptation-plan.md)）。每步 decode 多一趟 device→host→device 往返，Graph 需分段。
 
 **所以 A 的起跑策略调整**:judge-only kernel(路径②也需要、且不依赖 P0b)可**立即开写**;P0b 探针并行做、用来决定要不要把搬运也并进 kernel(路径①优化),而不是卡在它前面干等。
 
@@ -46,7 +46,7 @@
 
 ## B —— SFA 寻址（难点②：页码怎么对）
 
-**一句话职责**：让 NPU sparse attention 算子（`npu_sparse_flash_attention`）**正确读到 A 输出的物理槽号对应的 KV**。**首选不改算子**——SFA 内核源码确有 BSND 一层寻址分支能吃 hot slot，但生产 tuple 须 P1 验证。
+**一句话职责**：让 NPU sparse attention 算子（`npu_sparse_flash_attention`）**正确读到 A 输出的 hot buffer KV**。**首选不改算子**——当前主线先保持 GLM-5 生产调用的 PA_BSND + `block_table`，用重映射让 SFA 读 hot buffer；BSND 一层寻址分支作为优化/备选路线验证。
 
 **关键修正（内核源码推翻了"必须改算子"的旧前提）**：读 SFA 真源码（`ops-transformer/attention/sparse_flash_attention`）+ CI paramset 后确认：
 - `sparse_indices` 是"离散取 kvCache 的索引"清单（与 GPU `indices` 同性质），但 **kernel 内 `s2Idx = sparse_indices + s2StartIdx`，索引是窗口相对、非绝对槽号**（`service_vector_mla.h:207`，`util_regbase.h:70`）；
@@ -55,22 +55,22 @@
 - 粒度约束：arch35（950 类）硬编 `sparse_block_size=1`（仅 token-wise），block-wise 仅 arch22；
 - 支持图模式（`return_softmax_lse=False` 时）。
 
-**三条路线（按改动深度，[02 §2.3.2](02-npu-adaptation-plan.md)）**：
+**三条路线（按当前 GLM-5 改动量排序，[02 §2.3.2](02-npu-adaptation-plan.md)）**：
 
-- **路线 A（首选·不改算子）**：hot buffer 走 **BSND** 当 key/value，`sparse_indices` 填 hot slot 号。对位 GPU"扁平池 + 物理槽清单"，token 粒度，无需碰算子源码。**两个约束**：① BSND 要求 `layout_query==layout_kv`，故须把 query 从现网 TND 一并切到 BSND（query 侧 reshape）；② 槽号非绝对填入，须处理 `s2StartIdx` 基址（确认 decode 下为 0 或喂入前扣除）。
-- **路线 A′（不改算子·页粒度）**：保持 PA_BSND，重映射 `block_table` 指向 hot buffer。代价是页粒度驻留，但 query 可继续用 TND（PA_BSND 允许 query/kv 布局不一致），改动比 A 更局部。`sparse_block_size` 仍为 1，不受 arch35 限制。
-- **路线 C（兜底·改算子）**：仅当 A/A′ 经 P1 验证不可行时，才给 SFA 加 `PHYSICAL_HOT_SLOT` 模式。SFA 源码可读（在 `ops-transformer`，不在 `sgl-kernel-npu`），但改它需自带算子构建分发 + 确认生产二进制版本对齐，改动最深最被动。
+- **路线 A（当前主线·不改算子）**：保持 PA_BSND，重映射 `block_table` 指向 hot buffer。query 可继续用当前 TND 形态，改动最局部。代价是页粒度驻留：block_size=128 时，一个 miss token 可能放大成一个 128-token block，需要 P1 量化 hot buffer 和 H2D 成本。
+- **路线 B（优化/备选·不改算子）**：hot buffer 走 **BSND** 当 key/value，`sparse_indices` 填 hot slot 号。对位 GPU"扁平池 + 物理槽清单"，token 粒度，无 page 放大。约束是 BSND 要求 `layout_query==layout_kv`，故须把 query/rope/output 从现网 TND+PA_BSND 调用形态切过去；槽号还要处理 `s2StartIdx` 基址。
+- **路线 C（兜底·改算子）**：仅当 A/B 经 P1 验证不可行时，才给 SFA 加 `PHYSICAL_HOT_SLOT` 模式。SFA 源码可读（在 `ops-transformer`，不在 `sgl-kernel-npu`），但改它需自带算子构建分发 + 确认生产二进制版本对齐，改动最深最被动。
 
 **阶段任务**：
 
 | 阶段 | 干什么 |
 |------|--------|
-| **P1** | SFA 寻址探针：先验证路线 A（BSND 小 hot buffer + sparse_indices 直填 hot slot）或 A′（重映射 block_table）能否正确读到，做单层 golden test。这是**接口合法性验证**，不是改算子 |
-| **P3** | P1 通过则用 A/A′ 做多层 decode 对齐；不通过才退路线 C 改算子内部寻址 |
+| **P1** | SFA 寻址探针：先验证路线 A（PA_BSND remapped `block_table`）能否正确读 hot buffer，再验证路线 B（BSND 小 hot buffer + `sparse_indices` 直填 hot slot），做单层 golden test。这是**接口合法性验证**，不是改算子 |
+| **P3** | P1 通过则用 A/B 做多层 decode 对齐；不通过才退路线 C 改算子内部寻址 |
 
 **特点**：与 A、C 高度解耦——B 只关心"给我一张物理槽号清单，我让 SFA 正确读到对应 KV"。**B 可从第一天独立开干**，不必等 A 的 P0 结论。**且因首选不改算子，B 的工作量和风险比原先估计的低很多**。
 
-> 注意：`npu_sparse_flash_attention` 的源码**不在 `sgl-kernel-npu`**，但**在另一仓库 `ops-transformer/attention/sparse_flash_attention`、已可读**。路线 A/A′ 不需要改源码——只在 Python 侧调对 `layout_kv`/`sparse_indices`/`block_table` 即可；只有兜底路线 C 才需触及算子内部并自带构建分发（最被动）。`lightning_indexer`（top_k 引擎）的源码在 `sgl-kernel-npu` 包里（`csrc/lightning_indexer/op_kernel`，向量排序实证）。
+> 注意：`npu_sparse_flash_attention` 的源码**不在 `sgl-kernel-npu`**，但**在另一仓库 `ops-transformer/attention/sparse_flash_attention`、已可读**。路线 A/B 不需要改源码——只在 Python 侧调对 `layout_kv`/`sparse_indices`/`block_table` 即可；只有兜底路线 C 才需触及算子内部并自带构建分发（最被动）。`lightning_indexer`（top_k 引擎）的源码在 `sgl-kernel-npu` 包里（`csrc/lightning_indexer/op_kernel`，向量排序实证）。
 
 ---
 
@@ -83,7 +83,7 @@
 | 组件 | 类型 | 比方 | 职责 | 对标 GPU |
 |------|------|------|------|----------|
 | `NPUMLATokenToKVPoolHost` | Host pool | 仓库 | 存全量 KV，`aclrtHostRegister` 注册供 kernel 直读 | `MLATokenToKVPoolHost` |
-| `NPUHiSparseMLATokenToKVPool` | Device pool | 书桌 | 小 hot buffer，**布局随寻址路线定**：路线 A = BSND（`[B, device_buffer_size, N, D]`，`sparse_indices` 直填 hot slot）；路线 A′ = PA_BSND（`[hot_blocks, block_size, N, D]` + 重映射 block_table）。只分配 `device_buffer_size`（如 4k）槽 | `HiSparseNSATokenToKVPool` |
+| `NPUHiSparseMLATokenToKVPool` | Device pool | 书桌 | 小 hot buffer，**布局随寻址路线定**：路线 A = PA_BSND（`[hot_blocks, block_size, N, D]` + 重映射 block_table）；路线 B = BSND（`[B, device_buffer_size, N, D]`，`sparse_indices` 直填 hot slot）。只分配 `device_buffer_size`（如 4k）槽 | `HiSparseNSATokenToKVPool` |
 | `NPUHiSparseAllocator` | Allocator（调度器） | 管理员 | logical↔device 映射 + staging/decode/finish 生命周期 | `HiSparseTokenToKVPoolAllocator` |
 
 **三者关系**：管理员（allocator）拿着账本，在仓库（host pool）和书桌（device pool）之间调度——哪页从仓库搬上桌、哪页写回仓库、新 token 放书桌哪槽。两个 pool 是"存东西的地方"，allocator 是"指挥搬运的人"。
@@ -99,13 +99,13 @@
 | 同步（§2.8） | `main_stream` / `backup_stream` 双流 + event 红绿灯；守住"仓库没存好副本前别覆写书桌" |
 | **Python 参考实现** | 给 A 的 P2 做对齐 golden——**关键润滑剂**，让 A 写 kernel 时有对照物 |
 
-**P0 风险波及（C 要为两条路径都做准备）**：A 的 P0b 是二元分叉。**若走路径②**（kernel 读不了 host），swap-in 的实际搬运落到 C 头上——C 要在 swap-in 路径发显式 H2D staged DMA 并加 stream 同步，会打断 Graph。读过 `transfer_kv_dim_exchange` 的真实实现（[..../transfer_kv_dim_exchange.cpp](../sgl-kernel-npu/csrc/transfer_kv_dim_exchange/op_host/transfer_kv_dim_exchange.cpp)）后形态很清楚:它是**纯 host_api**——索引先 `.cpu()`、CPU 上逐页 `for` 循环、每页一发 `aclrtMemcpy2dAsync`(一次搬该页全部 layer，靠 5D 布局)。**但它强制 `device_k.dim()==5` + page 粒度,只适配路线 A′ 的 PA/page hot buffer;路线 A 的 BSND/token hot buffer 不匹配,C 须新写一个 staged copy（逐 token `aclrtMemcpyAsync` 或新算子）**。两种都值得早点摸熟——路径②它们就是主力搬运手段。**密切留意 A 的 P0b 结论。**
+**P0 风险波及（C 要为两条路径都做准备）**：A 的 P0b 是二元分叉。**若走路径②**（kernel 读不了 host），swap-in 的实际搬运落到 C 头上——C 要在 swap-in 路径发显式 H2D staged DMA 并加 stream 同步，会打断 Graph。读过 `transfer_kv_dim_exchange` 的真实实现（[..../transfer_kv_dim_exchange.cpp](../sgl-kernel-npu/csrc/transfer_kv_dim_exchange/op_host/transfer_kv_dim_exchange.cpp)）后形态很清楚:它是**纯 host_api**——索引先 `.cpu()`、CPU 上逐页 `for` 循环、每页一发 `aclrtMemcpy2dAsync`(一次搬该页全部 layer，靠 5D 布局)。**但它强制 `device_k.dim()==5` + page 粒度,更适合路线 A 的 PA/page hot buffer;路线 B 的 BSND/token hot buffer 不匹配,C 须新写一个 staged copy（逐 token `aclrtMemcpyAsync` 或新算子）**。两种都值得早点摸熟——路径②它们就是主力搬运手段。**密切留意 A 的 P0b 结论。**
 
 ---
 
 ## 协作约定
 
-1. **交汇就一个数据结构**：A 的输出 = B 的输入 = `top_k_device_locs`（物理槽号清单）。**第一周三人先把它的 shape 和语义敲成契约**，之后各写各的，P3 自然能接上。
+1. **交汇数据结构**：A 的输出 = B 的输入，至少包括 `top_k_device_locs`（物理槽号清单）和 hot page/block 映射。**第一周三人先把它们的 shape 和语义敲成契约**，之后各写各的，P3 自然能接上。
 2. **起跑姿势**（依赖关系决定）：
    - **A 第一周冲 P0a + judge-only kernel,P0b 并行探**（P0a 打通 `sgl-kernel-npu` 构建链路是写任何 kernel 的前提,可拿 `csrc/cache_location_assign/` 当模板;判定平面不依赖 host 直读,judge-only kernel 可立即开写;P0b 探针并行做,决定要不要把搬运并进 kernel——它不再卡住全局,[02 §2.7.5 架构判断](02-npu-adaptation-plan.md)）；
    - **B、C 不必等 A，立刻并行开干**（B 探 SFA 寻址、与 A 共享 `sgl-kernel-npu` 通路；C 搭 pool + 生命周期 + Python 参考实现 + 摸熟 `transfer_kv_dim_exchange` staged DMA 通路）。
@@ -121,6 +121,6 @@
 | P0b aclrtHostRegister 探针（门控分叉） | **A** | C 留意结论（决定路径①/②） |
 | P1 SFA 寻址探针 | **B** | — |
 | P2 AscendC residency kernel（路径②为 judge-only + C 的 staged DMA） | **A** | C 提供 Python 参考实现；路径②下 C 接搬运 |
-| P3 SFA 寻址定稿（首选路线 A，不改算子） | **B** | A 提供 `top_k_device_locs` |
+| P3 SFA 寻址定稿（先路线 A，再路线 B，均不改算子） | **B** | A 提供 `top_k_device_locs` 和 hot page/block 映射 |
 | P4 CANN Graph 验证 | **A + B + C** | 三流合体 |
 | P5 生产化（含 CP 路径） | **A + B + C** | 按子任务分 |
